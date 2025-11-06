@@ -18,9 +18,12 @@
   limitations under the License.
 */
 
+#include <stdint.h>
 #include <string.h>
+
 #include <sys/stat.h>
 #define  _CRT_SECURE_NO_WARNINGS
+
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -77,7 +80,7 @@ char *argv_to_cmd(char** argv);
 #define DECODER_FULL_REFERENCE 3
 
 static HANDLE child_handle, child_thread_handle;
-static HANDLE target_handle;
+static HANDLE target_handle = NULL;
 static HANDLE devnul_handle = INVALID_HANDLE_VALUE;
 static int fuzz_iterations_current;
 
@@ -93,6 +96,11 @@ static u32 attachpid;
 static u8 set_bp;
 static char *input_buf;
 static long input_length;
+static char* service_name = NULL;
+static DWORD timeoutMs = 1000;
+
+static SC_HANDLE hSCM;
+static SC_HANDLE hService;
 
 static bool child_entrypoint_reached;
 
@@ -255,7 +263,21 @@ static void load_custom_library(const char *libname)
 	SAYF("Sucessfully loaded and initalized\n");
 }
 
-static void
+static char *alloc_printf(const char *_str, ...) {
+	va_list argptr;
+    char* _tmp;
+	s32 _len;
+
+    va_start(argptr, _str);
+    _len = vsnprintf(NULL, 0, _str, argptr);
+    if (_len < 0) FATAL("Whoa, snprintf() fails?!");
+    _tmp = ck_alloc(_len + 1);
+    vsnprintf(_tmp, (size_t)_len + 1, _str, argptr);
+    va_end(argptr);
+    return _tmp;
+  }
+
+void
 winaflpt_options_init(int argc, const char *argv[])
 {
 	int i;
@@ -369,6 +391,13 @@ winaflpt_options_init(int argc, const char *argv[])
 			++i;
 			load_custom_library(argv[i]);
 		} 
+		else if (strcmp(token, "-service") == 0) {
+			USAGE_CHECK((i + 1) < argc, "missing service name");
+			++i;
+			attach = 1;
+			service_name = argv[i];
+			printf("Service name set to: %s\n", service_name);
+		}
 		else {
 			FATAL("UNRECOGNIZED OPTION: \"%s\"\n", token);
 		}
@@ -441,7 +470,7 @@ void build_address_ranges() {
 		current_address = tmp_buf[i].end + 1;
 	}
 	for (int i = 0; i < num_loaded_modules; i++) {
-		printf("Coverage range: %p - %p\n", (void*)coverage_ip_ranges[2 * i].start, (void*)coverage_ip_ranges[2 * i].end);
+		printf("Coverage range: %p - %p\n", (void*)coverage_ip_ranges[2 * i + 1].start, (void*)coverage_ip_ranges[2 * i + 1].end);
 	}
 	coverage_ip_ranges[2 * num_loaded_modules].start = current_address;
 	coverage_ip_ranges[2 * num_loaded_modules].end = 0xFFFFFFFFFFFFFFFFULL;
@@ -509,7 +538,7 @@ bool collect_thread_trace(PIPT_TRACE_HEADER traceHeader) {
 			trace_size = 0;
 			trace_buffer_overflow = true;
 
-			//printf("Warning: Trace buffer overflowed, trace will be truncated\n");
+			// printf("Warning: Trace buffer overflowed, trace will be truncated\n");
 			if (options.debug_mode) fprintf(debug_log, "Trace buffer overflowed, trace will be truncated\n");
 
 			char *trailing_data = traceHeader->Trace + traceHeader->RingBufferOffset;
@@ -828,10 +857,10 @@ size_t ReadProcessMemory_tolerant(HANDLE hProcess, LPCVOID lpBaseAddress, LPVOID
 	return total_size_read;
 }
 
-void add_module_to_section_cache(HMODULE module, char *module_name) {
+void add_module_to_section_cache(HANDLE handle, HMODULE module, char *module_name) {
 	module_info_t *loaded_module;
 	MODULEINFO module_info;
-	GetModuleInformation(target_handle, module, &module_info, sizeof(module_info));
+	GetModuleInformation(handle, module, &module_info, sizeof(module_info));
 
 	// handle the case where module was loaded previously
 	loaded_module = get_loaded_module(module_name, module_info.lpBaseOfDll);
@@ -858,8 +887,8 @@ void add_module_to_section_cache(HMODULE module, char *module_name) {
 
 	BYTE *modulebuf = (BYTE *)malloc(module_info.SizeOfImage);
 	size_t num_read;
-	if (!ReadProcessMemory(target_handle, module_info.lpBaseOfDll, modulebuf, module_info.SizeOfImage, &num_read) || (num_read != module_info.SizeOfImage)) {
-		if (!ReadProcessMemory_tolerant(target_handle, module_info.lpBaseOfDll, modulebuf, module_info.SizeOfImage)) {
+	if (!ReadProcessMemory(handle, module_info.lpBaseOfDll, modulebuf, module_info.SizeOfImage, &num_read) || (num_read != module_info.SizeOfImage)) {
+		if (!ReadProcessMemory_tolerant(handle, module_info.lpBaseOfDll, modulebuf, module_info.SizeOfImage)) {
 			FATAL("Error reading memory for module %s", module_name);
 		}
 	}
@@ -921,7 +950,7 @@ void on_module_loaded(HMODULE module, char *module_name) {
 		// }
 
 		if (options.decoder == DECODER_FULL_FAST || options.decoder == DECODER_FULL_REFERENCE) {
-			add_module_to_section_cache(module, module_name);
+			add_module_to_section_cache(child_handle, module, module_name);
 		}
 	}
 
@@ -932,7 +961,7 @@ void on_module_loaded(HMODULE module, char *module_name) {
 			FATAL("Error determining target method address\n");
 		}
 		printf("Target method %s found at address %p\n", options.fuzz_method, fuzz_address);
-		// printf("Fuzz method address: %p\n", fuzz_address);
+		printf("Fuzz method address: %p\n", fuzz_address);
 		options.fuzz_address = fuzz_address;
 
 		add_breakpoint(fuzz_address, BREAKPOINT_FUZZMETHOD, NULL, 0);
@@ -954,7 +983,7 @@ void on_target_module(HMODULE module, char *module_name) {
 	// }
 
 	if (options.decoder == DECODER_FULL_FAST || options.decoder == DECODER_FULL_REFERENCE) {
-		add_module_to_section_cache(module, module_name);
+		add_module_to_section_cache(target_handle, module, module_name);
 	}	
 }
 
@@ -992,7 +1021,7 @@ void write_stack(void *stack_addr, void **buffer, size_t numitems) {
 
 // called when the target method is called *for the first time only*
 void on_target_method(DWORD thread_id) {
-	printf("in OnTargetMethod\n");
+	// printf("in OnTargetMethod\n");
 
 	fuzz_thread_id = thread_id;
 
@@ -1164,7 +1193,7 @@ void on_target_method_ended(DWORD thread_id) {
 
 // called when process entrypoint gets reached
 void on_entrypoint() {
-	printf("Entrypoint\n");
+	// printf("Entrypoint\n");
 
 	HMODULE *module_handles = NULL;
 	DWORD num_modules = get_all_modules(&module_handles);
@@ -1577,60 +1606,20 @@ void start_process_attach() {
         }
     }
 
-    child_entrypoint_reached = false;
-
-    // if (mem_limit || cpu_aff) {
-    //     hJob = CreateJobObject(NULL, NULL);
-    //     if (hJob == NULL) {
-    //         FATAL("CreateJobObject failed, GLE=%d.\n", GetLastError());
-    //     }
-
-    //     ZeroMemory(&job_limit, sizeof(job_limit));
-    //     if (mem_limit) {
-    //         job_limit.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    //         job_limit.ProcessMemoryLimit = (size_t)(mem_limit * 1024 * 1024);
-    //     }
-
-    //     if (cpu_aff) {
-    //         job_limit.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY;
-    //         job_limit.BasicLimitInformation.Affinity = (DWORD_PTR)cpu_aff;
-    //     }
-
-    //     if (!SetInformationJobObject(
-    //         hJob,
-    //         JobObjectExtendedLimitInformation,
-    //         &job_limit,
-    //         sizeof(job_limit)
-    //     )) {
-    //         FATAL("SetInformationJobObject failed, GLE=%d.\n", GetLastError());
-    //     }
-    // }
-
-	// 1) Attach debugger to the target process
-    // if (!DebugActiveProcess(attachpid)) {
-    //     DWORD gle = GetLastError();
-    //     FATAL("DebugActiveProcess(%u) failed, GLE=%d.\n", attachpid, gle);
-    // }
-
-    // 2) Open process handle with needed rights
     target_handle = OpenProcess(
         PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME | PROCESS_TERMINATE | PROCESS_VM_OPERATION,
         FALSE,
         attachpid
     );
+
+	printf("Opened target process handle: %p\n", target_handle);
+
     if (target_handle == NULL) {
         DWORD gle = GetLastError();
         CloseHandle(target_handle);
 		FATAL("OpenProcess(%u) failed, GLE=%d.\n", attachpid, gle);
     }
-        
-	// if (mem_limit || cpu_aff) {
-	// 	if (!AssignProcessToJobObject(hJob, child_handle)) {
-	// 		FATAL("AssignProcessToJobObject failed, GLE=%d.\n", GetLastError());
-	// 	}
-	// }
 
-    // 5) 检测 WOW64 状态（和 CreateProcess 路径相同）
     BOOL wow64current = FALSE, wow64remote = FALSE;
     if (!IsWow64Process(target_handle, &wow64remote)) {
         FATAL("IsWow64Process failed");
@@ -1774,10 +1763,8 @@ void kill_process() {
 	CloseHandle(child_handle);
 	child_handle = NULL;
 	
-	if (attach) {
-		CloseHandle(child_thread_handle);
-		child_thread_handle = NULL;
-	}
+	CloseHandle(child_thread_handle);
+	child_thread_handle = NULL;
 
 	// delete any breakpoints that weren't hit
 	struct winafl_breakpoint *breakpoint = breakpoints;
@@ -1789,23 +1776,355 @@ void kill_process() {
 	breakpoints = NULL;
 }
 
+static BOOL GetAllThreadIdByProcessId(DWORD dwProcessId, DWORD** ppThreadId, DWORD* pdwThreadIdLength)
+{
+	DWORD* pThreadId = NULL;
+	DWORD dwThreadIdLength = 0;
+	DWORD dwBufferLength = 1000;
+	THREADENTRY32 te32 = { 0 };
+	HANDLE hSnapshot = NULL;
+	BOOL bRet = TRUE;
+
+	do
+	{
+		// 申请内存
+		pThreadId = (DWORD*)malloc(sizeof(DWORD) * dwBufferLength);
+		if (NULL == pThreadId)
+		{
+			printf("new");
+			bRet = FALSE;
+			break;
+		}
+		RtlZeroMemory(pThreadId, (dwBufferLength * sizeof(DWORD)));
+
+		// 获取线程快照
+		RtlZeroMemory(&te32, sizeof(te32));
+		te32.dwSize = sizeof(te32);
+		hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+		if (NULL == hSnapshot)
+		{
+			printf("CreateToolhelp32Snapshot");
+			bRet = FALSE;
+			break;
+		}
+
+		// 获取第一条线程快照信息
+		bRet = Thread32First(hSnapshot, &te32);
+		while (bRet)
+		{
+			// 获取进程对应的线程ID
+			if (te32.th32OwnerProcessID == dwProcessId)
+			{
+				pThreadId[dwThreadIdLength] = te32.th32ThreadID;
+				dwThreadIdLength++;
+			}
+
+			// 遍历下一个线程快照信息
+			bRet = Thread32Next(hSnapshot, &te32);
+		}
+
+		// 返回
+		*ppThreadId = pThreadId;
+		*pdwThreadIdLength = dwThreadIdLength;
+		bRet = TRUE;
+
+	} while (FALSE);
+
+	if (FALSE == bRet)
+	{
+		if (pThreadId)
+		{
+			free(pThreadId);
+			pThreadId = NULL;
+		}
+	}
+
+	return bRet;
+}
+
+static BOOL
+ConfigureThread (
+    _In_ DWORD dwPid,
+    _Out_ PHANDLE phThread
+    )
+{
+    BOOL bRes;
+    bRes = FALSE;
+    *phThread = NULL;
+
+    //
+    // Open a handle to it
+    //
+    *phThread = OpenThread(THREAD_GET_CONTEXT, FALSE, dwPid);
+    if (*phThread == NULL)
+    {
+        wprintf(L"[-] Unable to open TID %d (err=%d)\n",
+                dwPid, GetLastError());
+        goto Cleanup;
+    }
+    bRes = TRUE;
+
+Cleanup:
+    //
+    // Return result
+    //
+    return bRes;
+}
+
+static uint8_t ip_filter_iteration = 0;
+
+static void set_filter() {
+	BOOL bRet = FALSE;
+	DWORD* pThreadId = NULL;
+	DWORD dwThreadIdLength = 0;
+	address_range* current_range = &(coverage_ip_ranges[0]);
+	IPT_FILTER_RANGE_SETTINGS dwRangeConfig = 1;
+    DWORD64 ullStartAddress;
+    DWORD64 ullEndAddress;
+    BOOLEAN bTraceStop;
+	BOOL bRes; 
+	HANDLE hThread;
+
+	bRet = GetAllThreadIdByProcessId(attachpid, &pThreadId, &dwThreadIdLength);
+	if (FALSE == bRet)
+	{
+		return;
+	}
+	
+	for (DWORD i = 0; i < dwThreadIdLength; i++) {
+		if (!ConfigureThread(pThreadId[i], &hThread)) 
+			FATAL("ConfigureThread failed\n");
+		printf("configuring TID %d\n", pThreadId[i]);
+		bRet = ConfigureThreadAddressFilterRange(hThread, 0, 1, 0x7ffa640c0000, 0x7ffa640c0000 + 0x43000);
+		if (bRet == FALSE)
+			FATAL("ConfigureThreadAddressFilterRange returned %d\n", bRet);
+	}
+
+	free(pThreadId);
+}
+
+static DWORD get_service_PID(char* service_name) {
+	FILE* fp;
+	DWORD pid = 0;
+	char buffer[512];
+
+	fp = _popen("tasklist /svc | findstr /i svchost", "r");
+	if (!fp) {
+		perror("_popen");
+		return 0;
+	}
+
+	while (fgets(buffer, sizeof(buffer), fp)) {
+		char* pos_ptr;
+
+		pos_ptr = strstr(buffer, service_name);
+		
+		if (pos_ptr == NULL) {
+			continue;
+		}
+
+		char* line_start = buffer;
+		char* current = pos_ptr;
+
+		while (current > line_start && *current != ' ' && *current != '\t') {
+			current--;
+		}
+
+		while (current > line_start && (*current == ' ' || *current == '\t')) {
+			current--;
+		}
+
+		char* pid_end = current;
+		while (current > line_start && *current != ' ' && *current != '\t') {
+			current--;
+		}
+
+		if (*current == ' ' || *current == '\t') {
+			current++;
+		}
+
+		if (current <= pid_end) {
+			char pid_str[32];
+			int len = (int)(pid_end - current + 1);
+			if (len < sizeof(pid_str)) {
+				strncpy(pid_str, current, len);
+				pid_str[len] = '\0';
+				pid = atol(pid_str);
+				break;
+			}
+		}
+	}
+
+	_pclose(fp);
+
+	return pid;
+}
+
+static DWORD start_service() {
+	char* cmd = NULL;
+	DWORD pid = 0;
+	SERVICE_STATUS_PROCESS ssp;
+	DWORD startTime = GetTickCount();
+	DWORD bytesNeeded = 0;
+	DWORD startErr = 0;
+
+	hSCM = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCM) {
+        printf("OpenSCManager failed (%d)\n", GetLastError());
+        return 0;
+    }
+
+    hService = OpenService(hSCM, service_name, SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_STOP );
+    if (!hService) {
+        printf("OpenService failed (%d)\n", GetLastError());
+        CloseServiceHandle(hSCM);
+        return 0;
+    }
+
+    if (!StartService(hService, 0, NULL)) {
+        startErr = GetLastError();
+        if (startErr != ERROR_SERVICE_ALREADY_RUNNING && startErr != ERROR_SERVICE_MARKED_FOR_DELETE) {
+            printf("StartService failed: %u\n", startErr);
+            CloseServiceHandle(hService);
+            CloseServiceHandle(hSCM);
+            return 0;
+        }
+		
+    } 
+
+	while (1) {
+        if (!QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
+                                  (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded)) {
+            wprintf(L"QueryServiceStatusEx failed: %u\n", GetLastError());
+            break;
+        }
+
+        if (ssp.dwCurrentState == SERVICE_RUNNING) {
+            pid = ssp.dwProcessId; 
+            break;
+        }
+
+        if (ssp.dwCurrentState == SERVICE_STOPPED || ssp.dwCurrentState == SERVICE_STOP_PENDING) {
+            wprintf(L"Service state: %u (not running yet)\n", ssp.dwCurrentState);
+        }
+
+        if ((GetTickCount() - startTime) > timeoutMs) {
+            wprintf(L"Timeout waiting for service to enter RUNNING state.\n");
+            break;
+        }
+
+        Sleep(200);
+    }
+
+	return pid;
+}
+
+static void stop_service() {
+	char* cmd = NULL;
+	SERVICE_STATUS status;
+
+	if (service_name && options.persistent_trace) {
+		if (!StopProcessIptTracing(child_handle)) {
+			printf("Error stopping ipt trace\n");
+		}
+	}
+
+	if (!ControlService(hService, SERVICE_CONTROL_STOP, &status)) {
+		FATAL("ControlService failed: %lu\n", GetLastError());
+	} 
+
+	attachpid = 0;
+	target_handle = NULL;
+
+	CloseServiceHandle(hService);
+	CloseServiceHandle(hSCM);
+	
+}
+
+int run_test() {
+	BOOL bRet = FALSE;
+	DWORD* pThreadId = NULL;
+	DWORD dwThreadIdLength = 0;
+	IPT_FILTER_RANGE_SETTINGS dwRangeConfig = 1;
+    DWORD64 ullStartAddress;
+    DWORD64 ullEndAddress;
+	IPT_OPTIONS ipt_options;
+	HANDLE hThread;
+	
+	if(service_name)
+		attachpid = start_service();
+
+	if (attachpid == 0) {
+		FATAL("Could not get service PID\n");
+	}
+
+	printf("Attaching to PID %d\n", attachpid);
+
+	start_process_attach();
+	
+	memset(&ipt_options, 0, sizeof(IPT_OPTIONS));
+
+	if (!QueryProcessIptTracing(target_handle, &ipt_options)) {
+		printf("start trace\n");
+		memset(&ipt_options, 0, sizeof(IPT_OPTIONS));
+		ipt_options.OptionVersion = 1;
+
+		ConfigureBufferSize(options.trace_buffer_size, &ipt_options);
+		ConfigureTraceFlags(0, &ipt_options);
+		if (!StartProcessIptTracing(target_handle, ipt_options)) {
+			FATAL("ipt tracing error\n");
+		}
+
+		bRet = GetAllThreadIdByProcessId(attachpid, &pThreadId, &dwThreadIdLength);
+		if (FALSE == bRet)
+		{
+			return;
+		}
+		
+		for (DWORD i = 0; i < dwThreadIdLength; i++) {
+			if (!ConfigureThread(pThreadId[i], &hThread)) 
+				FATAL("ConfigureThread failed\n");
+
+			bRet = ConfigureThreadAddressFilterRange(hThread, 0, 1, 0x7ffa640c0000, 0x7ffa640c0000 + 0x43000);
+			if (bRet == FALSE)
+				FATAL("ConfigureThreadAddressFilterRange returned %d\n", bRet);
+		}
+	}
+
+	// wait some time
+	// Sleep(10000);
+
+	PIPT_TRACE_DATA trace_data = GetIptTrace(target_handle);
+	
+	FILE *file = NULL;
+	file = fopen("trace1s.log", "w+");
+	fwrite(trace_data->TraceData, sizeof(uint8_t), trace_data->TraceSize, file);
+	fclose(file);
+
+	stop_service();
+
+	return 0;
+}
+
 //int run_target_pt(char **argv, uint32_t timeout, char *buf, long fsize) {
 int run_target_pt(char **argv, uint32_t timeout) {
 	int debugger_status;
 	int status;
 	int ret = FAULT_NONE;
 	// input_buf = buf;
-	// input_length = fsize;
+	// input_length = fsize;	
 
-	// printf("argv[1]: %s\n", argv[1]);
-
-	if (attach &&!target_handle) {
-		if (dll_init_ptr){
-			if(!dll_init_ptr())
-				FATAL("User-defined custom initialization routine returned 0");
+	if (attach && !target_handle) {
+		if (service_name)
+			attachpid = start_service();
+		
+		if (attachpid == 0) {
+			FATAL("Could not get service PID\n");
 		}
 
+		printf("Attaching to PID %d\n", attachpid);
 		start_process_attach();
+
 		attach_on_target();	
 	}
 
@@ -1839,14 +2158,18 @@ int run_target_pt(char **argv, uint32_t timeout) {
 
 	if(options.debug_mode) fprintf(debug_log, "iteration %d\n", fuzz_iterations_current);
 
+	if (need_build_ranges) {
+		build_address_ranges();
+		need_build_ranges = false;
+	}
+
 	// start tracing
 	if ((!options.persistent_trace) || (fuzz_iterations_current == 0)) {
 		printf("Starting Intel PT tracing\n");
 		IPT_OPTIONS ipt_options;
 		memset(&ipt_options, 0, sizeof(IPT_OPTIONS));
-		QueryProcessIptTracing(target_handle, &ipt_options);
 
-		if (ipt_options.OptionVersion != 1){
+		if (!QueryProcessIptTracing(target_handle, &ipt_options)) {
 			printf("start trace\n");
 			memset(&ipt_options, 0, sizeof(IPT_OPTIONS));
 			ipt_options.OptionVersion = 1;
@@ -1855,15 +2178,17 @@ int run_target_pt(char **argv, uint32_t timeout) {
 			if (!StartProcessIptTracing(target_handle, ipt_options)) {
 				FATAL("ipt tracing error\n");
 			}
-			last_ring_buffer_offset = 0;
+			// set_filter();
 		}
+
+		last_ring_buffer_offset = 0;
+		
 	}
 
 	dbg_timeout_time = get_cur_time() + timeout;
 
-	// resumes_process();
-	if (dll_run_ptr) 
-		dll_run_ptr(input_buf, input_length, fuzz_iterations_current);
+	// if (dll_run_ptr) 
+	// 	dll_run_ptr(input_buf, input_length, fuzz_iterations_current);
 
 	/*
 	while (1) {
@@ -1898,17 +2223,23 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	if (ret == FAULT_CRASH)
 		return ret;
 	*/
-	//  debugger_status = debug_loop();
+	resumes_process();
+	debugger_status = debug_loop();
 
 	// printf("iteration end\n");
-
+	// Sleep(1000);
 	// collect trace
 	bool trace_buffer_overflowed = false;
 	PIPT_TRACE_DATA trace_data = GetIptTrace(target_handle);
+	// FILE *file = NULL;
+	// file = fopen("trace1s.log", "w+");
+	// fwrite(trace_data->TraceData, sizeof(uint8_t), trace_data->TraceSize, file);
+	// fclose(file);
+
 	if (!trace_data) {
 		printf("Error getting ipt trace\n");
 	} else {
-		// printf("%d\n", trace_data->TraceSize);
+		// printf("%lld\n", trace_data->TraceSize);
 		trace_buffer_overflowed = collect_trace(trace_data);
 		HeapFree(GetProcessHeap(), 0, trace_data);
 	}
@@ -1918,11 +2249,6 @@ int run_target_pt(char **argv, uint32_t timeout) {
 		if (!StopProcessIptTracing(target_handle)) {
 			printf("Error stopping ipt trace\n");
 		}
-	}
-
-	if (need_build_ranges) {
-		build_address_ranges();
-		need_build_ranges = false;
 	}
 
 	// process trace
@@ -1976,10 +2302,9 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	if (debugger_status == DEBUGGER_PROCESS_EXIT) {
 		CloseHandle(child_handle);
 		child_handle = NULL;
-		if (!attach) {
-			CloseHandle(child_thread_handle);
-			child_thread_handle = NULL;
-		}
+		CloseHandle(child_thread_handle);
+		child_thread_handle = NULL;
+		
 		ret = FAULT_TMOUT; //treat it as a hanggit config --global -l
 	} else if (debugger_status == DEBUGGER_HANGED) {
 		kill_process();
@@ -1987,20 +2312,23 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	} else if (debugger_status == DEBUGGER_CRASHED) {
 		kill_process();
 		ret = FAULT_CRASH;
+		// ret = FAULT_NONE;
 	} else if (debugger_status == DEBUGGER_FUZZMETHOD_END) {
 		ret = FAULT_NONE;
 	}
 
-	DWORD exitCode;
-	GetExitCodeProcess(target_handle, &exitCode);
+	// DWORD exitCode;
+	// GetExitCodeProcess(target_handle, &exitCode);
 	
-	if (exitCode != STILL_ACTIVE) {
-		ret = FAULT_CRASH;
-	}
+	// if (exitCode != STILL_ACTIVE) {
+	// 	ret = FAULT_CRASH;
+	// }
 
 	fuzz_iterations_current++;
-	if (fuzz_iterations_current == options.fuzz_iterations && child_handle != NULL) {
-		kill_process();
+	if (fuzz_iterations_current == options.fuzz_iterations) {
+		// stop_service();
+		if (child_handle != NULL)
+			kill_process();
 	}
 
 	return ret;

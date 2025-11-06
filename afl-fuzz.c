@@ -8176,7 +8176,9 @@ void load_custom_library(const char *libname)
 
 /* Main entry point */
 int main(int argc, char** argv) {
-
+  // winaflpt_options_init(argc - 1, argv + 1);
+  // run_test();
+  // return 0;
   s32 opt;
   u64 prev_queued = 0;
   u32 sync_interval_cnt = 0, seek_to;

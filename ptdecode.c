@@ -1594,7 +1594,7 @@ void analyze_trace_full_reference(unsigned char *trace_data, size_t trace_size,
 			if (!skip_next) {
 				skip_next = false;
 				update_coverage_map(block.ip, coverage_kind);
-				// printf("ip: %p, %d %d\n", (void *)block.ip, status, block.iclass);
+				printf("ip: %p, %d %d\n", (void *)block.ip, status, block.iclass);
 			}
 
 			// Sometimes, due to asynchronous events and other reasons (?)
